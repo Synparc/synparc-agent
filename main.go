@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -18,6 +19,7 @@ import (
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
 )
+
 
 type CheckinPayload struct {
 	AdGuid      string `json:"adGuid"`
@@ -287,15 +289,36 @@ func getResilientSmbShares(hostname string) []SmbShareItem {
 }
 
 
+// FIX-08: UUID Fallback persistant (remplace le UUID hardcodé)
+func getOrCreateLocalMachineUUID() string {
+	const machineIdFile = "machine-id.txt"
+	if data, err := os.ReadFile(machineIdFile); err == nil {
+		id := strings.TrimSpace(string(data))
+		if len(id) >= 32 {
+			log.Printf("📶 Identifiant machine local chargé : %s", id)
+			return id
+		}
+	}
+	// Générer un nouvel UUID aléatoire
+	b := make([]byte, 16)
+	rand.Read(b)
+	newId := fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+	os.WriteFile(machineIdFile, []byte(newId), 0644)
+	log.Printf("🆔 Nouvel identifiant machine généré et persisté : %s", newId)
+	return newId
+}
+
 func getRealSystemUuid() string {
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", "(Get-CimInstance Win32_ComputerSystemProduct).UUID")
 	if out, err := cmd.Output(); err == nil {
 		uuidStr := strings.TrimSpace(string(out))
 		if len(uuidStr) > 20 {
-			return uuidStr
+			return strings.ToLower(uuidStr)
 		}
 	}
-	return "0E05BAB0-1359-BC9B-A660-E9CDB0A83011"
+	// FIX-08: Fallback persistant (fini le UUID hardcodé partagé par toutes les machines)
+	return getOrCreateLocalMachineUUID()
 }
 
 func getRealActiveUserSession() string {
@@ -307,6 +330,60 @@ func getRealActiveUserSession() string {
 		}
 	}
 	return ""
+}
+
+// FIX-18: Persistance du machineId (survit aux redémarrages de l'agent)
+type MachineState struct {
+	MachineId   string `json:"machineId"`
+	LastCheckin string `json:"lastCheckin"`
+}
+
+func saveMachineState(machineId string) {
+	state := MachineState{MachineId: machineId, LastCheckin: time.Now().Format(time.RFC3339)}
+	data, _ := json.Marshal(state)
+	os.WriteFile("synparc-machine-state.json", data, 0600)
+}
+
+func loadMachineState() string {
+	data, err := os.ReadFile("synparc-machine-state.json")
+	if err != nil {
+		return ""
+	}
+	var state MachineState
+	if json.Unmarshal(data, &state) == nil {
+		return state.MachineId
+	}
+	return ""
+}
+
+// FIX-05: Helper HTTP qui ajoute automatiquement le header X-Agent-Token
+func doPost(client *http.Client, urlStr string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequest("POST", urlStr, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if AppConfig.AgentToken != "" {
+		req.Header.Set("X-Agent-Token", AppConfig.AgentToken)
+	}
+	return client.Do(req)
+}
+
+// FIX-09: Check-in avec retry exponentiel (5 tentatives max)
+func checkinWithRetry(client *http.Client, urlStr string, jsonData []byte, maxRetries int) (*http.Response, error) {
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			wait := time.Duration(1<<uint(attempt)) * time.Second
+			log.Printf("⏳ Tentative %d/%d dans %v...", attempt+1, maxRetries, wait)
+			time.Sleep(wait)
+		}
+		resp, err := doPost(client, urlStr, jsonData)
+		if err == nil {
+			return resp, nil
+		}
+		log.Printf("⚠️ Check-in tentative %d échouée : %v", attempt+1, err)
+	}
+	return nil, fmt.Errorf("serveur inaccessible après %d tentatives", maxRetries)
 }
 
 func main() {
@@ -350,18 +427,18 @@ func main() {
 		LocalIp:     getLocalIP(),
 	}
 
-	// 2. Check-in
+	// 2. Check-in avec retry exponentiel (FIX-09)
 	log.Println("📡 Envoi du Check-in au serveur...")
 	jsonData, _ := json.Marshal(payload)
-	
-	resp, err := httpClient.Post(AppConfig.ServerUrl+"/checkin", "application/json", bytes.NewBuffer(jsonData))
+
+	resp, err := checkinWithRetry(httpClient, AppConfig.ServerUrl+"/checkin", jsonData, 5)
 	if err != nil {
-		log.Fatalf("❌ Impossible de joindre le serveur (%s) : %v", AppConfig.ServerUrl, err)
+		log.Fatalf("❌ Impossible de joindre le serveur après plusieurs tentatives : %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("❌ Le serveur a rejeté le check-in (Status: %d)", resp.StatusCode)
+		log.Fatalf("❌ Le serveur a rejeté le check-in (Status: %d). Vérifiez le token X-Agent-Token dans config.json.", resp.StatusCode)
 	}
 
 	var checkinResp CheckinResponse
@@ -369,6 +446,9 @@ func main() {
 
 	machineId := checkinResp.MachineId
 	log.Printf("✅ Check-in réussi ! Machine ID : %s (UUID: %s)\n", machineId, adGuid)
+
+	// FIX-18: Persister le machineId pour les redémarrages
+	saveMachineState(machineId)
 
 	// Remontée de la session utilisateur réelle
 	activeUser := getRealActiveUserSession()
@@ -380,7 +460,8 @@ func main() {
 			"sessionType":  "interactive",
 		}
 		sData, _ := json.Marshal(sessionPayload)
-		if r, err := httpClient.Post(AppConfig.ServerUrl+"/sessions", "application/json", bytes.NewBuffer(sData)); err == nil {
+		// FIX-05: utiliser doPost() qui ajoute automatiquement le header X-Agent-Token
+		if r, err := doPost(httpClient, AppConfig.ServerUrl+"/sessions", sData); err == nil {
 			r.Body.Close()
 			log.Printf("👤 Session active détectée et enregistrée pour %s\n", activeUser)
 		}
