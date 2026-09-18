@@ -7,17 +7,20 @@ import (
 )
 
 type Config struct {
-	ServerUrl string `json:"serverUrl"`
-	ProxyUrl  string `json:"proxyUrl,omitempty"`
+	ServerUrl  string `json:"serverUrl"`
+	ProxyUrl   string `json:"proxyUrl,omitempty"`
+	AgentToken string `json:"agentToken,omitempty"`
 }
 
 var AppConfig Config
 
 func LoadConfig() {
 	// Valeurs par défaut
+	token := os.Getenv("AGENT_TOKEN")
 	AppConfig = Config{
-		ServerUrl: "http://localhost:3001/api/agent",
-		ProxyUrl:  "",
+		ServerUrl:  "http://localhost:3001/api/agent",
+		ProxyUrl:   "",
+		AgentToken: token,
 	}
 
 	file, err := os.Open("config.json")
