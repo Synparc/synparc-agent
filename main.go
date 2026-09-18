@@ -478,7 +478,7 @@ func main() {
 				Shares:    localShares,
 			}
 			sJson, _ := json.Marshal(sharesPayload)
-			r, err := httpClient.Post(AppConfig.ServerUrl+"/shares", "application/json", bytes.NewBuffer(sJson))
+			r, err := doPost(httpClient, AppConfig.ServerUrl+"/shares", sJson)
 			if err == nil {
 				r.Body.Close()
 				log.Printf("📁 %d partages SMB découverts et enregistrés au serveur central", len(localShares))
@@ -486,14 +486,27 @@ func main() {
 		}
 	}()
 
-	// 3. Boucle d'envoi des métriques
-	log.Println("📊 Début de la collecte des métriques (toutes les 10 secondes)...")
+	// 3. Boucle d'envoi des métriques & Check-in périodique
+	log.Println("📊 Début de la collecte des métriques (toutes les 10s) et check-in périodique (toutes les 30s)...")
 	
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
+	tickCount := 0
 	for range ticker.C {
-		// Collecte
+		tickCount++
+
+		// Check-in périodique toutes les 30 secondes (3 ticks) pour rafraîchir lastCheckinAt
+		if tickCount%3 == 0 {
+			go func() {
+				cJson, _ := json.Marshal(payload)
+				if r, err := doPost(httpClient, AppConfig.ServerUrl+"/checkin", cJson); err == nil {
+					r.Body.Close()
+				}
+			}()
+		}
+
+		// Collecte des métriques
 		h, _ := host.Info()
 		cpuUsage := getResilientCpuPercent()
 		ramUsage := getResilientRamPercent()
@@ -517,9 +530,9 @@ func main() {
 
 		metricsJson, _ := json.Marshal(metricsPayload)
 
-		// Envoi (en goroutine pour ne pas bloquer le ticker)
+		// Envoi sécurisé des métriques via doPost (avec header X-Agent-Token)
 		go func(data []byte) {
-			r, err := httpClient.Post(AppConfig.ServerUrl+"/metrics", "application/json", bytes.NewBuffer(data))
+			r, err := doPost(httpClient, AppConfig.ServerUrl+"/metrics", data)
 			if err != nil {
 				log.Printf("⚠️ Erreur d'envoi des métriques : %v\n", err)
 				return
